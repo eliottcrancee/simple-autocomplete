@@ -195,6 +195,7 @@ async function callApiWithContext(context, completionContext, token, overrides =
   if (!model) throw new Error('No model configured.');
 
   const extraBody = c.get('extraBody', {}) || {};
+  const { timeoutMs: timeoutOverride, ...bodyOverrides } = overrides;
   const body = {
     model,
     messages: buildMessagesFromContext(completionContext),
@@ -202,11 +203,12 @@ async function callApiWithContext(context, completionContext, token, overrides =
     temperature: c.get('temperature', 0),
     max_tokens: c.get('maxTokens', 256),
     ...extraBody,
-    ...overrides
+    ...bodyOverrides
   };
 
+  const timeoutMs = Number.isFinite(timeoutOverride) ? timeoutOverride : c.get('timeoutMs', 5000);
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), c.get('timeoutMs', 5000));
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const cancellation = token?.onCancellationRequested?.(() => controller.abort());
 
   try {
@@ -233,6 +235,15 @@ async function callApiWithContext(context, completionContext, token, overrides =
     const raw = data?.choices?.[0]?.message?.content ?? '';
     const completion = parseCompletion(raw, completionContext, c.get('maxLines', 20));
     return { completion, raw, data };
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      const timeoutError = new Error(
+        `Request timed out after ${timeoutMs} ms. The model was still generating — raise "simpleAutocomplete.timeoutMs" or reduce the work asked of the model (reasoning-heavy settings make requests much slower).`
+      );
+      timeoutError.name = 'AbortError';
+      throw timeoutError;
+    }
+    throw err;
   } finally {
     clearTimeout(timeout);
     cancellation?.dispose?.();
@@ -476,7 +487,10 @@ async function openConfig(context) {
             position: undefined
           };
         }
-        const result = await callApiWithContext(context, testContext, undefined, { max_tokens: Math.min(cfg().get('maxTokens', 256), 256) });
+        const result = await callApiWithContext(context, testContext, undefined, {
+          max_tokens: Math.min(cfg().get('maxTokens', 256), 256),
+          timeoutMs: Math.max(cfg().get('timeoutMs', 5000), 30000)
+        });
         const preview = result.completion
           ? `Test succeeded.\n\nCompletion preview:\n${JSON.stringify(result.completion.slice(0, 300))}${result.completion.length > 300 ? '…' : ''}`
           : 'Test succeeded — the provider responded, but returned no completion for this context.';
