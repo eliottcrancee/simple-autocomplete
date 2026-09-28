@@ -13,6 +13,7 @@ A minimal provider-agnostic VS Code inline code completion extension for OpenAI-
 - Conservative automatic mode: skips low-signal contexts where a suggestion is unlikely to help.
 - Can replace the current same-line token/selection, not only append after the cursor.
 - Configuration test works even when no text editor is open (uses a synthetic Python completion context).
+- Status bar indicator: shows disabled/ready/warning state, a spinner while a request is in flight, and opens the configuration panel on click.
 - Cancels stale requests while you keep typing.
 
 ## Configure

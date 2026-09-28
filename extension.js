@@ -4,6 +4,7 @@ const SECRET_KEY = 'simpleAutocomplete.apiKey';
 let requestSerial = 0;
 let missingKeyWarned = false;
 let configPanel;
+let statusBarItem;
 let output;
 
 function cfg() {
@@ -231,6 +232,27 @@ async function callApi(context, document, position, token, overrides = {}) {
   return { ...result, completionContext };
 }
 
+async function updateStatusBar(context) {
+  if (!statusBarItem) return;
+  const c = cfg();
+  if (!c.get('enabled', true)) {
+    statusBarItem.text = '$(circle-slash) SA';
+    statusBarItem.tooltip = 'Simple Autocomplete — disabled\nClick to configure';
+    statusBarItem.backgroundColor = undefined;
+    return;
+  }
+  const auth = await getApiKey(context);
+  const model = String(c.get('model', '')).trim() || '(not configured)';
+  statusBarItem.text = auth.key ? '$(sparkle) SA' : '$(warning) SA';
+  statusBarItem.tooltip = [
+    'Simple Autocomplete',
+    `Model: ${model}`,
+    `API key: ${auth.key ? `available via ${auth.source}` : `missing (${auth.source})`}`,
+    'Click to configure'
+  ].join('\n');
+  statusBarItem.backgroundColor = auth.key ? undefined : new vscode.ThemeColor('statusBarItem.warningBackground');
+}
+
 async function fetchCompletion(context, document, position, inlineContext, token) {
   const c = cfg();
   if (!c.get('enabled', true)) return null;
@@ -238,6 +260,7 @@ async function fetchCompletion(context, document, position, inlineContext, token
   if (!shouldRequestAutomatically(document, position, inlineContext)) return null;
 
   try {
+    if (statusBarItem) statusBarItem.text = '$(sync~spin) SA';
     const result = await callApi(context, document, position, token);
     return result.completion ? result : null;
   } catch (err) {
@@ -249,6 +272,8 @@ async function fetchCompletion(context, document, position, inlineContext, token
       }
     }
     return null;
+  } finally {
+    if (statusBarItem) statusBarItem.text = '$(sparkle) SA';
   }
 }
 
@@ -394,6 +419,7 @@ async function saveConfig(context, data) {
   ]);
   if (String(data.apiKey || '').trim()) await context.secrets.store(SECRET_KEY, String(data.apiKey).trim());
   missingKeyWarned = false;
+  await updateStatusBar(context);
 }
 
 async function openConfig(context) {
@@ -407,6 +433,7 @@ async function openConfig(context) {
         await renderConfigPanel(context, configPanel, 'Configuration saved.');
       } else if (msg.type === 'clearSecret') {
         await context.secrets.delete(SECRET_KEY);
+        await updateStatusBar(context);
         await renderConfigPanel(context, configPanel, 'Stored API key cleared.');
       } else if (msg.type === 'test') {
         const editor = vscode.window.activeTextEditor;
@@ -438,7 +465,7 @@ async function openConfig(context) {
   await renderConfigPanel(context, configPanel);
 }
 
-function activate(context) {
+async function activate(context) {
   output = vscode.window.createOutputChannel('Simple Autocomplete');
   context.subscriptions.push(output);
 
@@ -447,6 +474,7 @@ function activate(context) {
     vscode.commands.registerCommand('simpleAutocomplete.clearApiKey', async () => {
       await context.secrets.delete(SECRET_KEY);
       missingKeyWarned = false;
+      await updateStatusBar(context);
       vscode.window.showInformationMessage('Simple Autocomplete: stored API key cleared.');
     }),
     vscode.commands.registerCommand('simpleAutocomplete.showStatus', async () => {
@@ -454,6 +482,18 @@ function activate(context) {
       const c = cfg();
       const status = auth.key ? `Key available via ${auth.source}` : `No key: ${auth.source}`;
       vscode.window.showInformationMessage(`Simple Autocomplete — ${status}. Model: ${c.get('model', '') || '(not configured)'}.`);
+    })
+  );
+
+  statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  statusBarItem.name = 'Simple Autocomplete';
+  statusBarItem.command = 'simpleAutocomplete.configure';
+  context.subscriptions.push(statusBarItem);
+  await updateStatusBar(context);
+
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration(async e => {
+      if (e.affectsConfiguration('simpleAutocomplete')) await updateStatusBar(context);
     })
   );
 
