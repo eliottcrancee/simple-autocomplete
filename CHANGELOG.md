@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-09-28
+
+### Changed
+
+- Rewrote the default system prompt: the assistant now behaves as a proactive AI pair programmer that completes whole logical blocks (functions, branches, loops, error handling) instead of suggesting minimal, overly conservative edits. It infers intent from naming conventions, TODOs, existing imports, and language idioms.
+- Softened the JSON response contract accordingly: `null` is returned only when nothing useful can be added.
+- An empty or whitespace-only `simpleAutocomplete.systemPrompt` setting now falls back to the built-in default prompt.
+
 ## [0.5.1] - 2026-09-28
 
 ### Fixed
@@ -37,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cancellation of stale requests while typing.
 - `extraBody` setting for provider-specific JSON request fields.
 
+[0.6.0]: https://github.com/eliottcrancee/simple-autocomplete/releases/tag/v0.6.0
 [0.5.1]: https://github.com/eliottcrancee/simple-autocomplete/releases/tag/v0.5.1
 [0.5.0]: https://github.com/eliottcrancee/simple-autocomplete/releases/tag/v0.5.0
 [0.4.0]: https://github.com/eliottcrancee/simple-autocomplete/releases/tag/v0.4.0

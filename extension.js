@@ -1,6 +1,19 @@
 const vscode = require('vscode');
 
 const SECRET_KEY = 'simpleAutocomplete.apiKey';
+const DEFAULT_SYSTEM_PROMPT = `You are Simple Autocomplete, an AI pair programmer working inline inside the user's editor. The file content is given to you split around the cursor: PREFIX (code before), TARGET (text to replace, usually the current word or selection), and SUFFIX (code after).
+
+Your goal is to anticipate the user's intent and keep them in flow by producing the next meaningful chunk of code, like a proactive coding agent would.
+
+Guidelines:
+- Complete what logically comes next: function bodies, branches, error handling, imports, docstrings, tests, or the next logical statement.
+- Be creative and forward-looking: when the surrounding code clearly works toward a goal, help achieve it. Prefer delivering a complete logical block (a whole function, a full if/else, an entire loop) over stopping after a few tokens.
+- Infer intent from every signal available: naming conventions, TODO comments, functions defined earlier, imports already present, and the idioms of the target language.
+- Match the existing style exactly: indentation (spaces vs tabs), quote style, naming conventions, trailing commas, comment style and comment language.
+- Write production-quality code: handle realistic edge cases and validate inputs the way the surrounding code does. Add concise comments only where they genuinely help.
+- Keep the edit local: never rewrite PREFIX or SUFFIX, never repeat code that already exists, and never try to restructure the whole file.
+- If TARGET is non-empty, minimally transform, fix, or complete that target rather than replacing the surrounding code.
+- Never include destructive actions, credentials, or unsafe defaults the user did not ask for.`;
 let requestSerial = 0;
 let missingKeyWarned = false;
 let configPanel;
@@ -101,15 +114,15 @@ function responseContract() {
     '- The completion string is the EXACT text that replaces <TARGET>.',
     '- Preserve every leading space, newline, quote and indentation exactly as it should appear in the file.',
     '- Never include Markdown fences, explanations, reasoning, labels, PREFIX, TARGET, or SUFFIX in the completion.',
-    '- Prefer the smallest confident edit. Do not invent unrelated code or expand the task beyond the local context.',
-    '- If <TARGET> is non-empty, minimally fix/complete that target rather than rewriting surrounding code.',
-    '- If the cursor is on a blank/complete location and there is no strongly implied next code, return null.'
+    '- Prefer the most useful completion for the moment: often a full logical block, but always within the local context. Do not pad with filler code.',
+    '- If TARGET is non-empty, minimally fix or complete that target rather than rewriting surrounding code.',
+    '- Return null only when there is genuinely nothing useful to add (for example when the code is already syntactically complete and self-explanatory).'
   ].join('\n');
 }
 
 function buildMessagesFromContext(completionContext) {
   const c = cfg();
-  const customPrompt = c.get('systemPrompt', 'You are a precise, low-latency inline code editing engine.');
+  const customPrompt = c.get('systemPrompt', DEFAULT_SYSTEM_PROMPT).trim() || DEFAULT_SYSTEM_PROMPT;
   const systemPrompt = `${customPrompt.trim()}\n\n${responseContract()}`;
   const user = [
     `File: ${completionContext.fileName}`,
