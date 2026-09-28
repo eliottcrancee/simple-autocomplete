@@ -2,7 +2,7 @@
   "name": "simple-autocomplete",
   "displayName": "Simple Autocomplete: AI Inline Completions",
   "description": "Minimal provider-agnostic inline code completion for OpenAI-compatible chat completion APIs.",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "publisher": "local",
   "license": "MIT",
   "author": {

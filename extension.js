@@ -153,22 +153,27 @@ function parseCompletion(raw, completionContext, maxLines) {
   let completion;
 
   // Preferred path: strict JSON preserves significant whitespace inside the string.
-  try {
-    const parsed = JSON.parse(raw.trim());
-    if (parsed && Object.prototype.hasOwnProperty.call(parsed, 'completion')) {
-      if (parsed.completion === null) return '';
-      if (typeof parsed.completion === 'string') completion = parsed.completion;
-    }
-  } catch {}
+  const tryJsonContract = (text) => {
+    try {
+      const parsed = JSON.parse(text.trim());
+      if (parsed && Object.prototype.hasOwnProperty.call(parsed, 'completion')) {
+        if (parsed.completion === null) return '';
+        if (typeof parsed.completion === 'string') return parsed.completion;
+      }
+    } catch {}
+    return undefined;
+  };
+
+  completion = tryJsonContract(raw);
 
   // Robust fallbacks for models that ignore the JSON contract.
   if (completion === undefined) {
     const tagged = raw.match(/<COMPLETION>([\s\S]*?)<\/COMPLETION>/i);
-    if (tagged) completion = tagged[1];
+    if (tagged) completion = tryJsonContract(tagged[1]) ?? tagged[1];
   }
   if (completion === undefined) {
     const fenced = raw.match(/```(?:[a-zA-Z0-9_+.-]+)?\s*\n([\s\S]*?)```/);
-    if (fenced) completion = fenced[1].replace(/\n$/, '');
+    if (fenced) completion = tryJsonContract(fenced[1]) ?? fenced[1].replace(/\n$/, '');
   }
   if (completion === undefined) {
     const trimmed = raw.trim();

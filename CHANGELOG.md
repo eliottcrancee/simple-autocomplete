@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3] - 2026-09-28
+
+### Fixed
+
+- Completions no longer leak the raw `{"completion":"..."}` envelope into the editor when a model wraps its JSON answer in Markdown code fences or `<COMPLETION>` tags: fallback paths now re-parse the extracted payload against the JSON contract.
+
 ## [0.6.2] - 2026-09-28
 
 ### Fixed
