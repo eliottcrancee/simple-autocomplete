@@ -1,4 +1,4 @@
-# Inline Completion
+# Simple Autocomplete
 
 A minimal provider-agnostic VS Code inline code completion extension for OpenAI-compatible `/chat/completions` APIs.
 

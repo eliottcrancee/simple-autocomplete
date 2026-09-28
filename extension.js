@@ -1,13 +1,13 @@
 const vscode = require('vscode');
 
-const SECRET_KEY = 'inlineCompletion.apiKey';
+const SECRET_KEY = 'simpleAutocomplete.apiKey';
 let requestSerial = 0;
 let missingKeyWarned = false;
 let configPanel;
 let output;
 
 function cfg() {
-  return vscode.workspace.getConfiguration('inlineCompletion');
+  return vscode.workspace.getConfiguration('simpleAutocomplete');
 }
 
 async function getApiKey(context) {
@@ -245,7 +245,7 @@ async function fetchCompletion(context, document, position, inlineContext, token
       output.appendLine(`[completion] ${err?.stack || err}`);
       if (String(err?.message || '').startsWith('No API key') && !missingKeyWarned) {
         missingKeyWarned = true;
-        vscode.window.showWarningMessage('Inline Completion: no API key is available. Run “Inline Completion: Configure”.');
+        vscode.window.showWarningMessage('Simple Autocomplete: no API key is available. Run “Simple Autocomplete: Configure”.');
       }
     }
     return null;
@@ -303,7 +303,7 @@ async function renderConfigPanel(context, panel, message = '') {
 <meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${panel.webview.cspSource} 'unsafe-inline'; script-src 'nonce-${n}';">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Inline Completion</title>
+<title>Simple Autocomplete</title>
 <style>
   body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); background: var(--vscode-editor-background); padding: 24px; max-width: 900px; margin: auto; }
   h1 { margin-top: 0; }
@@ -323,7 +323,7 @@ async function renderConfigPanel(context, panel, message = '') {
 </style>
 </head>
 <body>
-  <h1>Inline Completion</h1>
+  <h1>Simple Autocomplete</h1>
   <p class="muted">Provider-agnostic OpenAI-compatible inline completion. Direct API keys are stored in VS Code SecretStorage and never written to settings.json.</p>
   ${message ? `<div class="message">${escapeHtml(message)}</div>` : ''}
   <div class="status"><strong>API key:</strong> ${escapeHtml(v.keyStatus)}</div>
@@ -398,7 +398,7 @@ async function saveConfig(context, data) {
 
 async function openConfig(context) {
   if (configPanel) { configPanel.reveal(); return; }
-  configPanel = vscode.window.createWebviewPanel('inlineCompletionConfig', 'Inline Completion', vscode.ViewColumn.One, { enableScripts: true });
+  configPanel = vscode.window.createWebviewPanel('simpleAutocompleteConfig', 'Simple Autocomplete', vscode.ViewColumn.One, { enableScripts: true });
   configPanel.onDidDispose(() => { configPanel = undefined; });
   configPanel.webview.onDidReceiveMessage(async msg => {
     try {
@@ -415,7 +415,7 @@ async function openConfig(context) {
           testContext = getReplacementContext(editor.document, editor.selection.active);
         } else {
           testContext = {
-            fileName: '__inline_completion_test__.py',
+            fileName: '__simple_autocomplete_test__.py',
             languageId: 'python',
             line: 2,
             column: 10,
@@ -439,21 +439,21 @@ async function openConfig(context) {
 }
 
 function activate(context) {
-  output = vscode.window.createOutputChannel('Inline Completion');
+  output = vscode.window.createOutputChannel('Simple Autocomplete');
   context.subscriptions.push(output);
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('inlineCompletion.configure', () => openConfig(context)),
-    vscode.commands.registerCommand('inlineCompletion.clearApiKey', async () => {
+    vscode.commands.registerCommand('simpleAutocomplete.configure', () => openConfig(context)),
+    vscode.commands.registerCommand('simpleAutocomplete.clearApiKey', async () => {
       await context.secrets.delete(SECRET_KEY);
       missingKeyWarned = false;
-      vscode.window.showInformationMessage('Inline Completion: stored API key cleared.');
+      vscode.window.showInformationMessage('Simple Autocomplete: stored API key cleared.');
     }),
-    vscode.commands.registerCommand('inlineCompletion.showStatus', async () => {
+    vscode.commands.registerCommand('simpleAutocomplete.showStatus', async () => {
       const auth = await getApiKey(context);
       const c = cfg();
       const status = auth.key ? `Key available via ${auth.source}` : `No key: ${auth.source}`;
-      vscode.window.showInformationMessage(`Inline Completion — ${status}. Model: ${c.get('model', '') || '(not configured)'}.`);
+      vscode.window.showInformationMessage(`Simple Autocomplete — ${status}. Model: ${c.get('model', '') || '(not configured)'}.`);
     })
   );
 
