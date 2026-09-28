@@ -489,6 +489,7 @@ async function activate(context) {
   statusBarItem.name = 'Simple Autocomplete';
   statusBarItem.command = 'simpleAutocomplete.configure';
   context.subscriptions.push(statusBarItem);
+  statusBarItem.show();
   await updateStatusBar(context);
 
   context.subscriptions.push(
