@@ -330,11 +330,12 @@ async function currentConfig(context) {
   };
 }
 
-async function renderConfigPanel(context, panel, message = '') {
+async function renderConfigPanel(context, panel, message = '', kind = 'info') {
   const v = await currentConfig(context);
   const n = nonce();
   const sourceEnv = v.apiKeySource === 'environment' ? 'checked' : '';
   const sourceSecret = v.apiKeySource === 'secret' ? 'checked' : '';
+  const messageClass = kind === 'success' ? 'success' : kind === 'error' ? 'error' : 'info';
   panel.webview.html = `<!doctype html>
 <html>
 <head>
@@ -357,13 +358,15 @@ async function renderConfigPanel(context, panel, message = '') {
   button.secondary { background:var(--vscode-button-secondaryBackground); color:var(--vscode-button-secondaryForeground); }
   .muted { color:var(--vscode-descriptionForeground); font-size:12px; }
   .status { margin:14px 0; padding:10px; background:var(--vscode-textBlockQuote-background); border-left:3px solid var(--vscode-textBlockQuote-border); }
-  .message { margin-bottom:14px; color:var(--vscode-notificationsInfoIcon-foreground); }
+  .message { margin-top:14px; padding:10px 12px; border-radius:3px; white-space:pre-wrap; word-break:break-word; }
+  .message.info { border:1px solid var(--vscode-input-border, transparent); background:var(--vscode-textBlockQuote-background); }
+  .message.success { color:var(--vscode-charts-green); border:1px solid var(--vscode-charts-green); }
+  .message.error { color:var(--vscode-errorForeground); border:1px solid var(--vscode-errorForeground); }
 </style>
 </head>
 <body>
   <h1>Simple Autocomplete</h1>
   <p class="muted">Provider-agnostic OpenAI-compatible inline completion. Direct API keys are stored in VS Code SecretStorage and never written to settings.json.</p>
-  ${message ? `<div class="message">${escapeHtml(message)}</div>` : ''}
   <div class="status"><strong>API key:</strong> ${escapeHtml(v.keyStatus)}</div>
   <div class="grid">
     <div class="full row"><input id="enabled" type="checkbox" ${v.enabled ? 'checked' : ''}><label for="enabled" style="margin:0">Enabled</label></div>
@@ -384,8 +387,10 @@ async function renderConfigPanel(context, panel, message = '') {
     <div class="full row">
       <button id="save">Save</button>
       <button id="test" class="secondary">Test configuration</button>
+      <button id="resetPrompt" class="secondary">Reset prompt to default</button>
       <button id="clear" class="secondary">Clear stored API key</button>
     </div>
+    ${message ? `<div class="message ${messageClass}">${escapeHtml(message)}</div>` : ''}
   </div>
 <script nonce="${n}">
 const vscode = acquireVsCodeApi();
@@ -401,6 +406,7 @@ document.getElementById('save').addEventListener('click', () => {
   }});
 });
 document.getElementById('test').addEventListener('click', () => vscode.postMessage({type:'test'}));
+document.getElementById('resetPrompt').addEventListener('click', () => vscode.postMessage({type:'resetPrompt'}));
 document.getElementById('clear').addEventListener('click', () => vscode.postMessage({type:'clearSecret'}));
 </script>
 </body></html>`;
@@ -443,11 +449,14 @@ async function openConfig(context) {
     try {
       if (msg.type === 'save') {
         await saveConfig(context, msg.data);
-        await renderConfigPanel(context, configPanel, 'Configuration saved.');
+        await renderConfigPanel(context, configPanel, 'Configuration saved.', 'success');
+      } else if (msg.type === 'resetPrompt') {
+        await cfg().update('systemPrompt', undefined, vscode.ConfigurationTarget.Global);
+        await renderConfigPanel(context, configPanel, 'System prompt reset to the built-in default.', 'info');
       } else if (msg.type === 'clearSecret') {
         await context.secrets.delete(SECRET_KEY);
         await updateStatusBar(context);
-        await renderConfigPanel(context, configPanel, 'Stored API key cleared.');
+        await renderConfigPanel(context, configPanel, 'Stored API key cleared.', 'info');
       } else if (msg.type === 'test') {
         const editor = vscode.window.activeTextEditor;
         let testContext;
@@ -468,11 +477,13 @@ async function openConfig(context) {
           };
         }
         const result = await callApiWithContext(context, testContext, undefined, { max_tokens: Math.min(cfg().get('maxTokens', 256), 256) });
-        const preview = result.completion ? JSON.stringify(result.completion.slice(0, 180)) : '(no completion — provider call succeeded)';
-        await renderConfigPanel(context, configPanel, `Success. Preview: ${preview}`);
+        const preview = result.completion
+          ? `Test succeeded.\n\nCompletion preview:\n${JSON.stringify(result.completion.slice(0, 300))}${result.completion.length > 300 ? '…' : ''}`
+          : 'Test succeeded — the provider responded, but returned no completion for this context.';
+        await renderConfigPanel(context, configPanel, preview, 'success');
       }
     } catch (err) {
-      await renderConfigPanel(context, configPanel, `Error: ${err?.message || err}`);
+      await renderConfigPanel(context, configPanel, `Test failed: ${err?.message || err}`, 'error');
     }
   });
   await renderConfigPanel(context, configPanel);
