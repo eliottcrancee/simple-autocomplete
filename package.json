@@ -1,0 +1,166 @@
+{
+  "name": "inline-completion",
+  "displayName": "Inline Completion",
+  "description": "Minimal provider-agnostic inline code completion for OpenAI-compatible chat completion APIs.",
+  "version": "0.3.0",
+  "publisher": "local",
+  "license": "MIT",
+  "author": {
+    "name": "eliottcrancee",
+    "url": "https://github.com/eliottcrancee"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eliottcrancee/simple-autocomplete.git"
+  },
+  "bugs": {
+    "url": "https://github.com/eliottcrancee/simple-autocomplete/issues"
+  },
+  "homepage": "https://github.com/eliottcrancee/simple-autocomplete#readme",
+  "keywords": [
+    "autocomplete",
+    "inline-completion",
+    "ai",
+    "openai",
+    "copilot"
+  ],
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "scripts": {
+    "lint": "eslint extension.js",
+    "package": "vsce package",
+    "vscode:prepublish": "npm run lint"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.0.0",
+    "eslint": "^9.0.0"
+  },
+  "categories": [
+    "Machine Learning",
+    "Programming Languages"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "inlineCompletion.configure",
+        "title": "Inline Completion: Configure"
+      },
+      {
+        "command": "inlineCompletion.showStatus",
+        "title": "Inline Completion: Show Status"
+      },
+      {
+        "command": "inlineCompletion.clearApiKey",
+        "title": "Inline Completion: Clear Stored API Key"
+      }
+    ],
+    "configuration": {
+      "title": "Inline Completion",
+      "properties": {
+        "inlineCompletion.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable inline completions."
+        },
+        "inlineCompletion.endpoint": {
+          "type": "string",
+          "default": "https://api.openai.com/v1/chat/completions",
+          "description": "Full OpenAI-compatible chat completions endpoint."
+        },
+        "inlineCompletion.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model ID used for inline completion."
+        },
+        "inlineCompletion.apiKeySource": {
+          "type": "string",
+          "enum": [
+            "environment",
+            "secret"
+          ],
+          "default": "environment",
+          "description": "Read the API key from an environment variable or VS Code SecretStorage."
+        },
+        "inlineCompletion.apiKeyEnvVar": {
+          "type": "string",
+          "default": "OPENAI_API_KEY",
+          "description": "Environment variable containing the API key when apiKeySource is environment."
+        },
+        "inlineCompletion.systemPrompt": {
+          "type": "string",
+          "default": "You are a precise, low-latency inline code editing engine. Infer the smallest locally useful edit from the code around TARGET. Respect the existing coding style and syntax. Be conservative: if the next edit is not strongly implied, make no suggestion.",
+          "description": "Custom system instructions. A strict JSON/whitespace response contract is appended automatically."
+        },
+        "inlineCompletion.extraBody": {
+          "type": "object",
+          "default": {},
+          "description": "Extra JSON properties merged into the request body, e.g. {\"reasoning_effort\": \"none\"}."
+        },
+        "inlineCompletion.maxTokens": {
+          "type": "number",
+          "default": 256,
+          "minimum": 16,
+          "maximum": 8192,
+          "description": "Maximum generated tokens per completion."
+        },
+        "inlineCompletion.temperature": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Sampling temperature."
+        },
+        "inlineCompletion.prefixChars": {
+          "type": "number",
+          "default": 7000,
+          "minimum": 500,
+          "maximum": 100000,
+          "description": "Maximum characters before the cursor sent as context."
+        },
+        "inlineCompletion.suffixChars": {
+          "type": "number",
+          "default": 3000,
+          "minimum": 0,
+          "maximum": 50000,
+          "description": "Maximum characters after the cursor sent as context."
+        },
+        "inlineCompletion.timeoutMs": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 500,
+          "maximum": 60000,
+          "description": "Request timeout in milliseconds."
+        },
+        "inlineCompletion.maxLines": {
+          "type": "number",
+          "default": 20,
+          "minimum": 1,
+          "maximum": 200,
+          "description": "Maximum number of completion lines shown as ghost text."
+        },
+        "inlineCompletion.excludedLanguages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "plaintext",
+            "dotenv",
+            "scminput"
+          ],
+          "description": "Language IDs where inline completion is disabled."
+        },
+        "inlineCompletion.conservative": {
+          "type": "boolean",
+          "default": true,
+          "description": "Suppress automatic requests in low-signal contexts such as empty top-level lines. Explicitly triggered inline suggestions still run."
+        }
+      }
+    }
+  }
+}

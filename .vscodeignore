@@ -1,0 +1,15 @@
+.gitignore
+.vscode/**
+.vscode-test/**
+node_modules/**
+src/**
+test/**
+esbuild.js
+eslint.config.mjs
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+**/*.map
+**/*.ts
+**/.DS_Store
+**/Thumbs.db
