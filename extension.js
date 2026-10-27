@@ -1,24 +1,37 @@
 const vscode = require('vscode');
+const {
+  CURSOR_MARKER,
+  cropStart,
+  cropEnd,
+  parseCompletion,
+  buildUserMessage,
+  responseContract,
+  buildEditMessage,
+  editContract,
+  parseEditSuggestions,
+  resolveUniqueRange
+} = require('./lib/context');
+const { buildRequest, resolveApiMode, sendRequest, waitForDebounce } = require('./lib/api');
 
 const SECRET_KEY = 'simpleAutocomplete.apiKey';
-const DEFAULT_SYSTEM_PROMPT = `You are Simple Autocomplete, an AI pair programmer working inline inside the user's editor. The file content is given to you split around the cursor: PREFIX (code before), TARGET (text to replace, usually the current word or selection), and SUFFIX (code after).
-
-Your goal is to anticipate the user's intent and keep them in flow by producing the next meaningful chunk of code, like a proactive coding agent would.
+const DEFAULT_SYSTEM_PROMPT = `You are an inline code completion engine. You receive a snippet of a file containing a single cursor marker ${CURSOR_MARKER}. Write the text that belongs exactly at that marker.
 
 Guidelines:
-- Complete what logically comes next: function bodies, branches, error handling, imports, docstrings, tests, or the next logical statement.
-- Be creative and forward-looking: when the surrounding code clearly works toward a goal, help achieve it. Prefer delivering a complete logical block (a whole function, a full if/else, an entire loop) over stopping after a few tokens.
-- Infer intent from every signal available: naming conventions, TODO comments, functions defined earlier, imports already present, and the idioms of the target language.
-- Match the existing style exactly: indentation (spaces vs tabs), quote style, naming conventions, trailing commas, comment style and comment language.
-- Write production-quality code: handle realistic edge cases and validate inputs the way the surrounding code does. Add concise comments only where they genuinely help.
-- Keep the edit local: never rewrite PREFIX or SUFFIX, never repeat code that already exists, and never try to restructure the whole file.
-- If TARGET is non-empty, minimally transform, fix, or complete that target rather than replacing the surrounding code.
-- Never include destructive actions, credentials, or unsafe defaults the user did not ask for.`;
+- Complete the current construct: statement, expression, block, documentation or string.
+- Match the language, indentation, quotes, naming, and comment/documentation style of the snippet.
+- Stay local. Do not invent or paste code that belongs elsewhere in the file.
+- Never repeat text that is already present before or after the marker.
+- It is better to return nothing than to guess something the user did not ask for.`;
 let requestSerial = 0;
+let activeCompletion;
+let activeCompletionUri;
+let lastRequest = '';
 let missingKeyWarned = false;
 let configPanel;
 let statusBarItem;
 let output;
+const pendingEdits = new Map();
+let codeLensEmitter;
 
 function cfg() {
   return vscode.workspace.getConfiguration('simpleAutocomplete');
@@ -40,10 +53,11 @@ async function getApiKey(context) {
   return { key: null, source: envName ? `${envName} environment variable (missing)` : 'environment variable (not configured)' };
 }
 
-function getReplacementContext(document, position) {
+function getReplacementContext(document, position, inlineContext) {
   const fullText = document.getText();
   const cursorOffset = document.offsetAt(position);
   let range = new vscode.Range(position, position);
+  let acceptedPrefix = '';
 
   const editor = vscode.window.activeTextEditor;
   if (editor && editor.document.uri.toString() === document.uri.toString()) {
@@ -53,28 +67,34 @@ function getReplacementContext(document, position) {
     }
   }
 
-  if (range.isEmpty) {
-    const wordRange = document.getWordRangeAtPosition(position, /[A-Za-z_][A-Za-z0-9_]*/);
-    if (wordRange && wordRange.start.line === wordRange.end.line && wordRange.contains(position)) {
-      range = wordRange;
-    }
+  const selected = inlineContext?.selectedCompletionInfo;
+  if (selected && selected.range.start.line === selected.range.end.line && selected.range.contains(position)) {
+    range = selected.range;
+    acceptedPrefix = selected.text;
   }
 
   const startOffset = document.offsetAt(range.start);
   const endOffset = document.offsetAt(range.end);
+  const target = fullText.slice(startOffset, endOffset);
   const c = cfg();
-  const prefixChars = c.get('prefixChars', 7000);
-  const suffixChars = c.get('suffixChars', 3000);
+  const prefixChars = c.get('prefixChars', 4000);
+  const suffixChars = c.get('suffixChars', 1500);
 
+  // Whole-line, bounded context around the replacement range. Keeping the window
+  // small and local is what stops the model from pulling in unrelated code.
   return {
     fileName: document.fileName || 'untitled',
     languageId: document.languageId,
     line: position.line + 1,
     column: position.character + 1,
-    prefix: fullText.slice(Math.max(0, startOffset - prefixChars), startOffset),
-    target: fullText.slice(startOffset, endOffset),
-    suffix: fullText.slice(endOffset, Math.min(fullText.length, endOffset + suffixChars)),
+    prefix: fullText.slice(cropStart(fullText, startOffset, prefixChars), startOffset) + acceptedPrefix,
+    target,
+    suffix: fullText.slice(endOffset, cropEnd(fullText, endOffset, suffixChars)),
     range,
+    acceptedPrefix,
+    fullText,
+    startOffset,
+    endOffset,
     lineText: document.lineAt(position.line).text,
     position,
     cursorOffset
@@ -82,9 +102,10 @@ function getReplacementContext(document, position) {
 }
 
 function shouldRequestAutomatically(document, position, context) {
+  if (context?.triggerKind === vscode.InlineCompletionTriggerKind.Invoke) return true;
+
   const c = cfg();
   if (!c.get('conservative', true)) return true;
-  if (context?.triggerKind === vscode.InlineCompletionTriggerKind.Invoke) return true;
 
   const line = document.lineAt(position.line).text;
   const before = line.slice(0, position.character);
@@ -96,169 +117,62 @@ function shouldRequestAutomatically(document, position, context) {
     const indentation = before.length;
     const prev = position.line > 0 ? document.lineAt(position.line - 1).text.trimEnd() : '';
     const last = prev.slice(-1);
-    const opensContext = ':=([{.,\\'.includes(last) || /(?:return|yield|raise|await)\s*$/.test(prev);
+    const opensContext = Boolean(last) && (':=([{.,\\'.includes(last) || /(?:return|yield|raise|await)\s*$/.test(prev));
     if (indentation === 0 && !opensContext) return false;
   }
 
-  // Skip comments that contain no obvious unfinished code marker.
-  if (before.trimStart().startsWith('#') && !/[=:([{.]\s*$/.test(before)) return false;
   return true;
-}
-
-function responseContract() {
-  return [
-    'RESPONSE CONTRACT (mandatory):',
-    '- Reply with exactly one JSON object and nothing else.',
-    '- Use {"completion":"..."} when there is a useful edit.',
-    '- Use {"completion":null} when no completion is clearly useful.',
-    '- The completion string is the EXACT text that replaces <TARGET>.',
-    '- Preserve every leading space, newline, quote and indentation exactly as it should appear in the file.',
-    '- Never include Markdown fences, explanations, reasoning, labels, PREFIX, TARGET, or SUFFIX in the completion.',
-    '- Prefer the most useful completion for the moment: often a full logical block, but always within the local context. Do not pad with filler code.',
-    '- If TARGET is non-empty, minimally fix or complete that target rather than rewriting surrounding code.',
-    '- Return null only when there is genuinely nothing useful to add (for example when the code is already syntactically complete and self-explanatory).'
-  ].join('\n');
 }
 
 function buildMessagesFromContext(completionContext) {
   const c = cfg();
   const customPrompt = c.get('systemPrompt', DEFAULT_SYSTEM_PROMPT).trim() || DEFAULT_SYSTEM_PROMPT;
-  const systemPrompt = `${customPrompt.trim()}\n\n${responseContract()}`;
-  const user = [
-    `File: ${completionContext.fileName}`,
-    `Language: ${completionContext.languageId}`,
-    `Cursor: line ${completionContext.line}, column ${completionContext.column}`,
-    `Operation: ${completionContext.target ? 'replace TARGET' : 'insert at TARGET'}`,
-    '',
-    '<PREFIX>',
-    completionContext.prefix,
-    '</PREFIX>',
-    '<TARGET>',
-    completionContext.target,
-    '</TARGET>',
-    '<SUFFIX>',
-    completionContext.suffix,
-    '</SUFFIX>',
-    '',
-    'Produce the smallest useful completion under the response contract.'
-  ].join('\n');
+  const format = c.get('responseFormat', 'text') === 'json' ? 'json' : 'text';
+  const systemPrompt = `${customPrompt.trim()}\n\n${responseContract(format)}`;
   return [
     { role: 'system', content: systemPrompt },
-    { role: 'user', content: user }
+    { role: 'user', content: buildUserMessage(completionContext) }
   ];
 }
 
-function parseCompletion(raw, completionContext, maxLines) {
-  if (typeof raw !== 'string' || raw.length === 0) return '';
-  let completion;
-
-  // Preferred path: strict JSON preserves significant whitespace inside the string.
-  const tryJsonContract = (text) => {
-    try {
-      const parsed = JSON.parse(text.trim());
-      if (parsed && Object.prototype.hasOwnProperty.call(parsed, 'completion')) {
-        if (parsed.completion === null) return '';
-        if (typeof parsed.completion === 'string') return parsed.completion;
-      }
-    } catch {}
-    return undefined;
-  };
-
-  completion = tryJsonContract(raw);
-
-  // Robust fallbacks for models that ignore the JSON contract.
-  if (completion === undefined) {
-    const tagged = raw.match(/<COMPLETION>([\s\S]*?)<\/COMPLETION>/i);
-    if (tagged) completion = tryJsonContract(tagged[1]) ?? tagged[1];
+async function requestCompletion(context, messages, token, overrides = {}, completionContext) {
+  const c = cfg();
+  const auth = await getApiKey(context);
+  if (!auth.key) throw new Error(`No API key available from ${auth.source}.`);
+  const { timeoutMs: timeoutOverride, ...bodyOverrides } = overrides;
+  const request = buildRequest({
+    endpoint: c.get('endpoint', ''),
+    apiMode: c.get('apiMode', 'auto'),
+    model: c.get('model', ''),
+    temperature: c.get('temperature', 0),
+    maxTokens: c.get('maxTokens', 256),
+    extraBody: c.get('extraBody', {}) || {}
+  }, completionContext, messages, bodyOverrides);
+  const timeoutMs = Number.isFinite(timeoutOverride) ? timeoutOverride : c.get('timeoutMs', 5000);
+  const started = Date.now();
+  try {
+    const result = await sendRequest(request, { key: auth.key, timeoutMs, token });
+    lastRequest = `${request.mode}: ${Date.now() - started} ms, ${result.raw.length} generated characters`;
+    output.appendLine(`[request] ${lastRequest}`);
+    return result;
+  } catch (err) {
+    if (err?.name !== 'AbortError') lastRequest = `${request.mode}: ${err.message}`;
+    throw err;
   }
-  if (completion === undefined) {
-    const fenced = raw.match(/```(?:[a-zA-Z0-9_+.-]+)?\s*\n([\s\S]*?)```/);
-    if (fenced) completion = tryJsonContract(fenced[1]) ?? fenced[1].replace(/\n$/, '');
-  }
-  if (completion === undefined) {
-    const trimmed = raw.trim();
-    if (/^(?:none|null|no completion|no suggestion)$/i.test(trimmed)) return '';
-    completion = raw;
-  }
-
-  if (!completion || !completion.trim()) return '';
-  if (completion === completionContext.target) return '';
-
-  const lines = completion.split('\n');
-  if (lines.length > maxLines) completion = lines.slice(0, maxLines).join('\n');
-  return completion;
 }
 
 async function callApiWithContext(context, completionContext, token, overrides = {}) {
   const c = cfg();
-  const auth = await getApiKey(context);
-  if (!auth.key) throw new Error(`No API key available from ${auth.source}.`);
-
-  const endpoint = String(c.get('endpoint', '')).trim();
-  const model = String(c.get('model', '')).trim();
-  if (!endpoint) throw new Error('No API endpoint configured.');
-  if (!model) throw new Error('No model configured.');
-
-  const extraBody = c.get('extraBody', {}) || {};
-  const { timeoutMs: timeoutOverride, ...bodyOverrides } = overrides;
-  const body = {
-    model,
-    messages: buildMessagesFromContext(completionContext),
-    stream: false,
-    temperature: c.get('temperature', 0),
-    max_tokens: c.get('maxTokens', 256),
-    ...extraBody,
-    ...bodyOverrides
-  };
-
-  const timeoutMs = Number.isFinite(timeoutOverride) ? timeoutOverride : c.get('timeoutMs', 5000);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  const cancellation = token?.onCancellationRequested?.(() => controller.abort());
-
-  try {
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${auth.key}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal
-    });
-
-    const responseText = await response.text();
-    if (!response.ok) {
-      output.appendLine(`HTTP ${response.status} ${response.statusText}: ${responseText}`);
-      throw new Error(`HTTP ${response.status} ${response.statusText}`);
-    }
-
-    let data;
-    try { data = JSON.parse(responseText); }
-    catch { throw new Error('The provider returned a non-JSON response.'); }
-
-    const raw = data?.choices?.[0]?.message?.content ?? '';
-    const completion = parseCompletion(raw, completionContext, c.get('maxLines', 20));
-    return { completion, raw, data };
-  } catch (err) {
-    if (err?.name === 'AbortError') {
-      const timeoutError = new Error(
-        `Request timed out after ${timeoutMs} ms. The model was still generating — raise "simpleAutocomplete.timeoutMs" or reduce the work asked of the model (reasoning-heavy settings make requests much slower).`
-      );
-      timeoutError.name = 'AbortError';
-      throw timeoutError;
-    }
-    throw err;
-  } finally {
-    clearTimeout(timeout);
-    cancellation?.dispose?.();
-  }
+  const { raw, data, mode } = await requestCompletion(context, buildMessagesFromContext(completionContext), token, overrides, completionContext);
+  const completion = parseCompletion(raw, completionContext, c.get('maxLines', 20), { mode });
+  if (raw && !completion) output.appendLine('[completion] Empty after output filtering.');
+  return { completion, raw, data };
 }
 
-async function callApi(context, document, position, token, overrides = {}) {
-  const completionContext = getReplacementContext(document, position);
-  const result = await callApiWithContext(context, completionContext, token, overrides);
-  return { ...result, completionContext };
+async function callApi(context, document, position, token, overrides = {}, completionContext) {
+  const ctx = completionContext || getReplacementContext(document, position);
+  const result = await callApiWithContext(context, ctx, token, overrides);
+  return { ...result, completionContext: ctx };
 }
 
 async function updateStatusBar(context) {
@@ -272,25 +186,31 @@ async function updateStatusBar(context) {
   }
   const auth = await getApiKey(context);
   const model = String(c.get('model', '')).trim() || '(not configured)';
-  statusBarItem.text = auth.key ? '$(sparkle) SA' : '$(warning) SA';
+  const ready = auth.key && model !== '(not configured)' && String(c.get('endpoint', '')).trim();
+  statusBarItem.text = activeCompletion ? '$(sync~spin) SA' : ready ? '$(sparkle) SA' : '$(warning) SA';
   statusBarItem.tooltip = [
     'Simple Autocomplete',
     `Model: ${model}`,
+    `API mode: ${c.get('apiMode', 'auto')}`,
     `API key: ${auth.key ? `available via ${auth.source}` : `missing (${auth.source})`}`,
+    lastRequest ? `Last request: ${lastRequest}` : 'No requests yet',
     'Click to configure'
   ].join('\n');
-  statusBarItem.backgroundColor = auth.key ? undefined : new vscode.ThemeColor('statusBarItem.warningBackground');
+  statusBarItem.backgroundColor = ready ? undefined : new vscode.ThemeColor('statusBarItem.warningBackground');
 }
 
 async function fetchCompletion(context, document, position, inlineContext, token) {
   const c = cfg();
   if (!c.get('enabled', true)) return null;
   if (c.get('excludedLanguages', ['plaintext', 'dotenv', 'scminput']).includes(document.languageId)) return null;
+
+  // Build the context once so the same snippet drives the gate and the request.
+  const completionContext = getReplacementContext(document, position, inlineContext);
   if (!shouldRequestAutomatically(document, position, inlineContext)) return null;
 
   try {
     if (statusBarItem) statusBarItem.text = '$(sync~spin) SA';
-    const result = await callApi(context, document, position, token);
+    const result = await callApi(context, document, position, token, {}, completionContext);
     return result.completion ? result : null;
   } catch (err) {
     if (err?.name !== 'AbortError') {
@@ -302,8 +222,108 @@ async function fetchCompletion(context, document, position, inlineContext, token
     }
     return null;
   } finally {
+    await updateStatusBar(context);
+  }
+}
+
+// --- Suggested edits anywhere in the document ---------------------------------
+// The stable inline-completion API cannot render ghost text away from the cursor.
+// CodeLens is the native, stable way to attach a one-click action to a line
+// elsewhere: the model returns find/replace pairs, we locate each one exactly and
+// anchor a lens on its line.
+
+function editsKey(document) {
+  return document.uri.toString();
+}
+
+async function suggestEdits(context) {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    vscode.window.showInformationMessage('Simple Autocomplete: open a file first.');
+    return;
+  }
+  const document = editor.document;
+  const c = cfg();
+  if (!c.get('enabled', true)) return;
+  if (c.get('excludedLanguages', ['plaintext', 'dotenv', 'scminput']).includes(document.languageId)) return;
+
+  const fullText = document.getText();
+  const version = document.version;
+  const cursorOffset = document.offsetAt(editor.selection.active);
+  const code = fullText.slice(cropStart(fullText, cursorOffset, 6000), cropEnd(fullText, cursorOffset, 4000));
+  const maxEdits = c.get('maxEdits', 3);
+  const messages = [
+    { role: 'system', content: editContract() },
+    {
+      role: 'user',
+      content: buildEditMessage({
+        fileName: document.fileName || 'untitled',
+        languageId: document.languageId,
+        code,
+        maxEdits
+      })
+    }
+  ];
+
+  try {
+    if (statusBarItem) statusBarItem.text = '$(sync~spin) SA';
+    const { raw } = await requestCompletion(context, messages, undefined, {
+      max_tokens: Math.max(c.get('maxTokens', 256), 700),
+      timeoutMs: Math.max(c.get('timeoutMs', 5000), 30000)
+    });
+    if (document.version !== version || document.isClosed) return;
+    const edits = parseEditSuggestions(raw, fullText, maxEdits).map((edit, index) => ({
+      ...edit,
+      id: `${document.version}-${index}`
+    }));
+    if (edits.length) {
+      pendingEdits.set(editsKey(document), { version: document.version, edits });
+    } else {
+      pendingEdits.delete(editsKey(document));
+    }
+    codeLensEmitter?.fire();
+    vscode.window.showInformationMessage(
+      edits.length
+        ? `Simple Autocomplete: ${edits.length} suggested edit(s). Click the sparkle lens above the line.`
+        : 'Simple Autocomplete: no edits suggested for this file.'
+    );
+  } catch (err) {
+    output.appendLine(`[edits] ${err?.stack || err}`);
+    vscode.window.showErrorMessage(`Simple Autocomplete: ${err?.message || err}`);
+  } finally {
     if (statusBarItem) statusBarItem.text = '$(sparkle) SA';
   }
+}
+
+async function applySuggestedEdit(uriString, editId) {
+  const entry = pendingEdits.get(uriString);
+  if (!entry) return;
+  const edit = entry.edits.find(candidate => candidate.id === editId);
+  if (!edit) return;
+
+  const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(uriString));
+  if (entry.version !== document.version || document.getText().slice(edit.startOffset, edit.endOffset) !== edit.find) {
+    pendingEdits.delete(uriString);
+    codeLensEmitter?.fire();
+    return;
+  }
+  const workspaceEdit = new vscode.WorkspaceEdit();
+  const range = new vscode.Range(document.positionAt(edit.startOffset), document.positionAt(edit.endOffset));
+  workspaceEdit.replace(document.uri, range, edit.replace);
+  if (!(await vscode.workspace.applyEdit(workspaceEdit))) return;
+
+  // Offsets shift after an edit: re-locate the remaining suggestions on the new text.
+  const updatedText = document.getText();
+  const remaining = entry.edits
+    .filter(candidate => candidate.id !== editId)
+    .map(candidate => {
+      const resolved = resolveUniqueRange(updatedText, candidate.find);
+      return resolved ? { ...candidate, ...resolved } : null;
+    })
+    .filter(Boolean);
+  if (remaining.length) pendingEdits.set(uriString, { version: document.version, edits: remaining });
+  else pendingEdits.delete(uriString);
+  codeLensEmitter?.fire();
 }
 
 function escapeHtml(value) {
@@ -329,6 +349,7 @@ async function currentConfig(context) {
   return {
     enabled: c.get('enabled', true),
     endpoint: c.get('endpoint', ''),
+    apiMode: c.get('apiMode', 'auto'),
     model: c.get('model', ''),
     apiKeySource: c.get('apiKeySource', 'environment'),
     apiKeyEnvVar: c.get('apiKeyEnvVar', 'OPENAI_API_KEY'),
@@ -338,11 +359,13 @@ async function currentConfig(context) {
     extraBody: JSON.stringify(c.get('extraBody', {}) || {}, null, 2),
     maxTokens: c.get('maxTokens', 256),
     temperature: c.get('temperature', 0),
-    prefixChars: c.get('prefixChars', 7000),
-    suffixChars: c.get('suffixChars', 3000),
+    prefixChars: c.get('prefixChars', 4000),
+    suffixChars: c.get('suffixChars', 1500),
+    debounceMs: c.get('debounceMs', 150),
     timeoutMs: c.get('timeoutMs', 5000),
     maxLines: c.get('maxLines', 20),
-    conservative: c.get('conservative', true)
+    conservative: c.get('conservative', true),
+    responseFormat: c.get('responseFormat', 'text')
   };
 }
 
@@ -388,12 +411,16 @@ async function renderConfigPanel(context, panel, message = '', kind = 'info') {
     <div class="full row"><input id="enabled" type="checkbox" ${v.enabled ? 'checked' : ''}><label for="enabled" style="margin:0">Enabled</label></div>
     <div class="full"><label for="endpoint">API endpoint</label><input id="endpoint" value="${escapeHtml(v.endpoint)}" placeholder="https://provider.example/v1/chat/completions"></div>
     <div><label for="model">Model</label><input id="model" value="${escapeHtml(v.model)}" placeholder="model-id"></div>
+    <div><label for="apiMode">API mode</label><select id="apiMode"><option value="auto" ${v.apiMode === 'auto' ? 'selected' : ''}>Auto (detect from endpoint)</option><option value="chat" ${v.apiMode === 'chat' ? 'selected' : ''}>Chat completions (GreenPT, compatible APIs)</option><option value="fim" ${v.apiMode === 'fim' ? 'selected' : ''}>Native FIM (Mistral Codestral)</option></select></div>
+    <div class="full muted">Chat sends messages. Native FIM sends the code before the cursor as prompt and the code after it as suffix. Auto selects FIM for /fim/completions endpoints.</div>
     <div><label>API key source</label><div class="row"><label><input name="keySource" type="radio" value="environment" ${sourceEnv}> Environment variable</label><label><input name="keySource" type="radio" value="secret" ${sourceSecret}> Stored key</label></div></div>
     <div><label for="envVar">Environment variable name</label><input id="envVar" value="${escapeHtml(v.apiKeyEnvVar)}" placeholder="OPENAI_API_KEY"></div>
     <div><label for="apiKey">Direct API key</label><input id="apiKey" type="password" placeholder="${v.hasStoredSecret ? 'Stored securely — leave blank to keep it' : 'Paste key to store securely'}"></div>
-    <div class="full"><label for="systemPrompt">System prompt</label><textarea id="systemPrompt">${escapeHtml(v.systemPrompt)}</textarea><div class="muted">Your instructions are editable. A strict JSON output/whitespace contract is appended automatically so indentation and line breaks survive exactly.</div></div>
+    <div><label for="responseFormat">Chat response format (ignored in native FIM)</label><select id="responseFormat"><option value="text" ${v.responseFormat === 'text' ? 'selected' : ''}>Raw insertion text</option><option value="json" ${v.responseFormat === 'json' ? 'selected' : ''}>JSON contract</option></select></div>
+    <div><label for="debounceMs">Typing delay (ms)</label><input id="debounceMs" type="number" min="0" max="2000" value="${v.debounceMs}"></div>
+    <div class="full"><label for="systemPrompt">Chat system prompt (ignored in native FIM)</label><textarea id="systemPrompt">${escapeHtml(v.systemPrompt)}</textarea><div class="muted">A response contract is appended automatically for chat requests.</div></div>
     <div class="full row"><input id="conservative" type="checkbox" ${v.conservative ? 'checked' : ''}><label for="conservative" style="margin:0">Conservative automatic suggestions (skip low-signal contexts)</label></div>
-    <div class="full"><label for="extraBody">Extra request body (JSON)</label><textarea id="extraBody">${escapeHtml(v.extraBody)}</textarea><div class="muted">Provider-specific options, e.g. { "reasoning_effort": "none" }. These values override the default request fields when keys overlap.</div></div>
+    <div class="full"><label for="extraBody">Extra generation options (JSON)</label><textarea id="extraBody">${escapeHtml(v.extraBody)}</textarea><div class="muted">For example { "reasoning_effort": "none" } if supported by the chat model. Model, stream and context fields are managed by the extension.</div></div>
     <div><label for="maxTokens">Max tokens</label><input id="maxTokens" type="number" value="${v.maxTokens}"></div>
     <div><label for="temperature">Temperature</label><input id="temperature" type="number" step="0.1" value="${v.temperature}"></div>
     <div><label for="prefixChars">Prefix chars</label><input id="prefixChars" type="number" value="${v.prefixChars}"></div>
@@ -415,9 +442,9 @@ const number = id => Number(value(id));
 document.getElementById('save').addEventListener('click', () => {
   vscode.postMessage({ type:'save', data:{
     enabled: document.getElementById('enabled').checked,
-    endpoint:value('endpoint'), model:value('model'),
+    endpoint:value('endpoint'), model:value('model'), apiMode:value('apiMode'), debounceMs:number('debounceMs'),
     apiKeySource:document.querySelector('input[name="keySource"]:checked').value,
-    apiKeyEnvVar:value('envVar'), apiKey:value('apiKey'), systemPrompt:value('systemPrompt'), extraBody:value('extraBody'),
+    apiKeyEnvVar:value('envVar'), apiKey:value('apiKey'), systemPrompt:value('systemPrompt'), extraBody:value('extraBody'), responseFormat:value('responseFormat'),
     maxTokens:number('maxTokens'), temperature:number('temperature'), prefixChars:number('prefixChars'), suffixChars:number('suffixChars'), timeoutMs:number('timeoutMs'), maxLines:number('maxLines'), conservative:document.getElementById('conservative').checked
   }});
 });
@@ -439,6 +466,8 @@ async function saveConfig(context, data) {
   await Promise.all([
     c.update('enabled', Boolean(data.enabled), target),
     c.update('endpoint', String(data.endpoint).trim(), target),
+    c.update('apiMode', ['chat', 'fim'].includes(data.apiMode) ? data.apiMode : 'auto', target),
+    c.update('debounceMs', Math.max(0, Math.min(2000, Number(data.debounceMs) || 0)), target),
     c.update('model', String(data.model).trim(), target),
     c.update('apiKeySource', data.apiKeySource === 'secret' ? 'secret' : 'environment', target),
     c.update('apiKeyEnvVar', String(data.apiKeyEnvVar).trim(), target),
@@ -450,7 +479,8 @@ async function saveConfig(context, data) {
     c.update('suffixChars', Number(data.suffixChars), target),
     c.update('timeoutMs', Number(data.timeoutMs), target),
     c.update('maxLines', Number(data.maxLines), target),
-    c.update('conservative', Boolean(data.conservative), target)
+    c.update('conservative', Boolean(data.conservative), target),
+    c.update('responseFormat', data.responseFormat === 'json' ? 'json' : 'text', target)
   ]);
   if (String(data.apiKey || '').trim()) await context.secrets.store(SECRET_KEY, String(data.apiKey).trim());
   missingKeyWarned = false;
@@ -524,7 +554,15 @@ async function activate(context) {
       const auth = await getApiKey(context);
       const c = cfg();
       const status = auth.key ? `Key available via ${auth.source}` : `No key: ${auth.source}`;
-      vscode.window.showInformationMessage(`Simple Autocomplete — ${status}. Model: ${c.get('model', '') || '(not configured)'}.`);
+      let mode;
+      try { mode = resolveApiMode(c.get('apiMode', 'auto'), c.get('endpoint', '')); } catch { mode = 'invalid endpoint'; }
+      vscode.window.showInformationMessage(`Simple Autocomplete — ${status}. Model: ${c.get('model', '') || '(not configured)'}. API: ${mode}. ${lastRequest}`);
+    }),
+    vscode.commands.registerCommand('simpleAutocomplete.suggestEdits', () => suggestEdits(context)),
+    vscode.commands.registerCommand('simpleAutocomplete.applyEdit', (uriString, editId) => applySuggestedEdit(uriString, editId)),
+    vscode.commands.registerCommand('simpleAutocomplete.clearEdits', () => {
+      pendingEdits.clear();
+      codeLensEmitter?.fire();
     })
   );
 
@@ -537,38 +575,84 @@ async function activate(context) {
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration(async e => {
-      if (e.affectsConfiguration('simpleAutocomplete')) await updateStatusBar(context);
+      if (e.affectsConfiguration('simpleAutocomplete')) {
+        activeCompletion?.cancel();
+        await updateStatusBar(context);
+      }
+    })
+  );
+
+  // Suggested edits: a lens sits above each line the model wants to change, so an
+  // edit away from the cursor is still one click, and disappears as soon as the
+  // document changes.
+  codeLensEmitter = new vscode.EventEmitter();
+  context.subscriptions.push(codeLensEmitter);
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeTextDocument(event => {
+      if (event.document.uri.toString() === activeCompletionUri) activeCompletion?.cancel();
+      const entry = pendingEdits.get(event.document.uri.toString());
+      if (entry && entry.version !== event.document.version) {
+        pendingEdits.delete(event.document.uri.toString());
+        codeLensEmitter?.fire();
+      }
+    }),
+    vscode.workspace.onDidSaveTextDocument(async document => {
+      if (!cfg().get('suggestEditsOnSave', false)) return;
+      if (vscode.window.activeTextEditor?.document.uri.toString() !== document.uri.toString()) return;
+      await suggestEdits(context);
     })
   );
 
   const selector = [{ scheme: 'file' }, { scheme: 'untitled' }, { scheme: 'vscode-notebook-cell' }];
+  context.subscriptions.push(vscode.languages.registerCodeLensProvider(selector, {
+    onDidChangeCodeLenses: codeLensEmitter.event,
+    provideCodeLenses(document) {
+      const entry = pendingEdits.get(document.uri.toString());
+      if (!entry || entry.version !== document.version) return [];
+      return entry.edits.map(edit => {
+        const position = document.positionAt(edit.startOffset);
+        return new vscode.CodeLens(document.lineAt(position.line).range, {
+          title: `$(sparkle) ${edit.reason || 'Apply suggested edit'}`,
+          tooltip: `${edit.find.trim()}\n→\n${edit.replace.trim()}`,
+          command: 'simpleAutocomplete.applyEdit',
+          arguments: [document.uri.toString(), edit.id]
+        });
+      });
+    }
+  }));
   context.subscriptions.push(vscode.languages.registerInlineCompletionItemProvider(selector, {
     async provideInlineCompletionItems(document, position, inlineContext, token) {
       const mySerial = ++requestSerial;
-      const result = await fetchCompletion(context, document, position, inlineContext, token);
-      if (token.isCancellationRequested || mySerial !== requestSerial || !result?.completion) return [];
+      activeCompletion?.cancel();
+      const cancellation = new vscode.CancellationTokenSource();
+      activeCompletion = cancellation;
+      activeCompletionUri = document.uri.toString();
+      const subscription = token.onCancellationRequested(() => cancellation.cancel());
+      const version = document.version;
+      try {
+        if (token.isCancellationRequested) return [];
+        const delay = inlineContext.triggerKind === vscode.InlineCompletionTriggerKind.Invoke ? 0 : cfg().get('debounceMs', 150);
+        if (!(await waitForDebounce(delay, cancellation.token))) return [];
+        const result = await fetchCompletion(context, document, position, inlineContext, cancellation.token);
+        if (cancellation.token.isCancellationRequested || mySerial !== requestSerial || document.version !== version || document.isClosed || !result?.completion) return [];
 
-      const { completion, completionContext } = result;
-      const range = completionContext.range || new vscode.Range(position, position);
-
-      // Stable VS Code inline-completion ranges are single-line. Multiline output is
-      // safe only when the replacement ends at EOL; otherwise suppress it instead
-      // of producing broken/shifted ghost text.
-      if (completion.includes('\n')) {
-        const lineEnd = document.lineAt(range.end.line).range.end;
-        if (!range.end.isEqual(lineEnd)) return [];
+        const { completionContext } = result;
+        const range = completionContext.range;
+        const text = completionContext.acceptedPrefix + result.completion;
+        const completion = document.eol === vscode.EndOfLine.CRLF ? text.replace(/\r?\n/g, '\r\n') : text.replace(/\r\n/g, '\n');
+        return [new vscode.InlineCompletionItem(completion, range)];
+      } finally {
+        subscription.dispose();
+        if (activeCompletion === cancellation) {
+          activeCompletion = undefined;
+          activeCompletionUri = undefined;
+        }
+        cancellation.dispose();
+        await updateStatusBar(context);
       }
-
-      const item = new vscode.InlineCompletionItem(completion, range);
-      if (!range.isEmpty) {
-        // Ensure VS Code is willing to display a genuine replacement, not just an
-        // append-only completion. The public API supports same-line replacement ranges.
-        item.filterText = completionContext.target + completion;
-      }
-      return [item];
     }
   }));
 }
 
-function deactivate() {}
+function deactivate() { activeCompletion?.cancel(); }
 module.exports = { activate, deactivate };

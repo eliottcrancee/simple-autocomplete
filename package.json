@@ -1,8 +1,8 @@
 {
   "name": "simple-autocomplete",
   "displayName": "Simple Autocomplete: AI Inline Completions",
-  "description": "Minimal provider-agnostic inline code completion for OpenAI-compatible chat completion APIs.",
-  "version": "0.6.3",
+  "description": "Inline code completion for chat APIs and native fill-in-the-middle APIs, including GreenPT and Mistral Codestral.",
+  "version": "0.10.0",
   "publisher": "local",
   "license": "MIT",
   "author": {
@@ -28,7 +28,8 @@
     "vscode": "^1.90.0"
   },
   "scripts": {
-    "lint": "eslint extension.js",
+    "lint": "eslint extension.js lib test",
+    "test": "node --test test",
     "package": "vsce package",
     "vscode:prepublish": "npm run lint"
   },
@@ -57,6 +58,18 @@
       {
         "command": "simpleAutocomplete.clearApiKey",
         "title": "Simple Autocomplete: Clear Stored API Key"
+      },
+      {
+        "command": "simpleAutocomplete.suggestEdits",
+        "title": "Simple Autocomplete: Suggest Edits Around Cursor"
+      },
+      {
+        "command": "simpleAutocomplete.applyEdit",
+        "title": "Simple Autocomplete: Apply Suggested Edit"
+      },
+      {
+        "command": "simpleAutocomplete.clearEdits",
+        "title": "Simple Autocomplete: Clear Suggested Edits"
       }
     ],
     "configuration": {
@@ -70,7 +83,20 @@
         "simpleAutocomplete.endpoint": {
           "type": "string",
           "default": "https://api.openai.com/v1/chat/completions",
-          "description": "Full OpenAI-compatible chat completions endpoint."
+          "description": "Full chat or native FIM endpoint, e.g. https://api.greenpt.ai/v1/chat/completions or https://api.mistral.ai/v1/fim/completions."
+        },
+        "simpleAutocomplete.apiMode": {
+          "type": "string",
+          "enum": ["auto", "chat", "fim"],
+          "default": "auto",
+          "description": "Auto detects /fim/completions endpoints. Chat sends messages; native FIM sends prompt (code before cursor) and suffix (code after cursor), as supported by Mistral Codestral."
+        },
+        "simpleAutocomplete.debounceMs": {
+          "type": "number",
+          "default": 150,
+          "minimum": 0,
+          "maximum": 2000,
+          "description": "Wait after typing before sending an automatic request. Explicit inline suggestions run immediately."
         },
         "simpleAutocomplete.model": {
           "type": "string",
@@ -93,13 +119,13 @@
         },
         "simpleAutocomplete.systemPrompt": {
           "type": "string",
-          "default": "You are Simple Autocomplete, an AI pair programmer working inline inside the user's editor. The file content is given to you split around the cursor: PREFIX (code before), TARGET (text to replace, usually the current word or selection), and SUFFIX (code after).\n\nYour goal is to anticipate the user's intent and keep them in flow by producing the next meaningful chunk of code, like a proactive coding agent would.\n\nGuidelines:\n- Complete what logically comes next: function bodies, branches, error handling, imports, docstrings, tests, or the next logical statement.\n- Be creative and forward-looking: when the surrounding code clearly works toward a goal, help achieve it. Prefer delivering a complete logical block (a whole function, a full if/else, an entire loop) over stopping after a few tokens.\n- Infer intent from every signal available: naming conventions, TODO comments, functions defined earlier, imports already present, and the idioms of the target language.\n- Match the existing style exactly: indentation (spaces vs tabs), quote style, naming conventions, trailing commas, comment style and comment language.\n- Write production-quality code: handle realistic edge cases and validate inputs the way the surrounding code does. Add concise comments only where they genuinely help.\n- Keep the edit local: never rewrite PREFIX or SUFFIX, never repeat code that already exists, and never try to restructure the whole file.\n- If TARGET is non-empty, minimally transform, fix, or complete that target rather than replacing the surrounding code.\n- Never include destructive actions, credentials, or unsafe defaults the user did not ask for.",
-          "description": "Custom system instructions. A strict JSON/whitespace response contract is appended automatically."
+          "default": "You are an inline code completion engine. You receive a snippet of a file containing a single cursor marker ⟪CURSOR⟫. Write the text that belongs exactly at that marker.\n\nGuidelines:\n- Complete the current construct: statement, expression, block, documentation or string.\n- Match the language, indentation, quotes, naming, and comment/documentation style of the snippet.\n- Stay local. Do not invent or paste code that belongs elsewhere in the file.\n- Never repeat text that is already present before or after the marker.\n- It is better to return nothing than to guess something the user did not ask for.",
+          "description": "Custom chat system instructions. An insertion response contract is appended automatically. Ignored by native FIM."
         },
         "simpleAutocomplete.extraBody": {
           "type": "object",
           "default": {},
-          "description": "Extra JSON properties merged into the request body, e.g. {\"reasoning_effort\": \"none\"}."
+          "description": "Extra generation options, e.g. {\"reasoning_effort\": \"none\"} when supported by the chat model. Model, stream and context fields are managed by the extension."
         },
         "simpleAutocomplete.maxTokens": {
           "type": "number",
@@ -117,17 +143,17 @@
         },
         "simpleAutocomplete.prefixChars": {
           "type": "number",
-          "default": 7000,
+          "default": 4000,
           "minimum": 500,
           "maximum": 100000,
-          "description": "Maximum characters before the cursor sent as context."
+          "description": "Maximum characters of whole-line context before the cursor sent as the snippet."
         },
         "simpleAutocomplete.suffixChars": {
           "type": "number",
-          "default": 3000,
+          "default": 1500,
           "minimum": 0,
           "maximum": 50000,
-          "description": "Maximum characters after the cursor sent as context."
+          "description": "Maximum characters of whole-line context after the cursor sent as the snippet."
         },
         "simpleAutocomplete.timeoutMs": {
           "type": "number",
@@ -159,8 +185,41 @@
           "type": "boolean",
           "default": true,
           "description": "Suppress automatic requests in low-signal contexts such as empty top-level lines. Explicitly triggered inline suggestions still run."
+        },
+        "simpleAutocomplete.responseFormat": {
+          "type": "string",
+          "enum": [
+            "json",
+            "text"
+          ],
+          "default": "text",
+          "enumDescriptions": [
+            "Ask for a single JSON object ({\"completion\":\"...\"}). Useful for chat models that need a strict output shape.",
+            "Ask for raw insertion text."
+          ],
+          "description": "Chat response format. Ignored in native FIM, where the model returns raw code."
+        },
+        "simpleAutocomplete.suggestEditsOnSave": {
+          "type": "boolean",
+          "default": false,
+          "description": "After saving a file, ask the model for suggested edits around the cursor and show them as clickable CodeLens actions."
+        },
+        "simpleAutocomplete.maxEdits": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Maximum number of suggested edits shown for one review."
         }
       }
-    }
+    },
+    "keybindings": [
+      {
+        "command": "simpleAutocomplete.suggestEdits",
+        "key": "ctrl+alt+.",
+        "mac": "cmd+alt+.",
+        "when": "editorTextFocus"
+      }
+    ]
   }
 }
