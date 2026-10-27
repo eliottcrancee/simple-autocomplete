@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-10-27
+
+### Added
+
+- Automatic replacement suggestions after a typing pause in chat mode, enabled by default. The delay is configurable with `editDebounceMs` (1500 ms by default); `suggestEditsAutomatically` switches the feature off.
+- Preview, Apply and Dismiss actions above each proposed change. Preview opens immutable before/after snapshots in VS Code's native diff editor.
+- Commands to preview, apply or dismiss the nearest suggestion. `Cmd+Alt+Enter` / `Ctrl+Alt+Enter` accepts it from the source or diff editor.
+- Cursor-line context for edit review prompts and one suggestion per automatic review. Manual reviews retain the configurable `maxEdits` limit.
+- Cancellation of pending edit reviews on typing, editor changes, configuration changes and dismissal. Automatic reviews stay quiet and do not modify the buffer without acceptance.
+
+### Fixed
+
+- Reject overlapping edits, matches outside the transmitted snippet, and ambiguous matches with overlapping occurrences.
+- Prevent dismissed replacements from reappearing automatically in the same file session.
+- Retain and relocate remaining proposals after acceptance; avoid triggering a new review solely because a suggested edit was accepted.
+- Include pending edit activity and the number of available suggestions in the status bar.
+
 ## [0.10.0] - 2026-10-27
 
 ### Added

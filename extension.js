@@ -32,6 +32,13 @@ let statusBarItem;
 let output;
 const pendingEdits = new Map();
 let codeLensEmitter;
+let editTimer;
+let activeEditRequest;
+let editRequestSerial = 0;
+let applyingSuggestedEdit = false;
+const dismissedEdits = new Map();
+const editPreviews = new Map();
+const PREVIEW_SCHEME = 'simple-autocomplete-preview';
 
 function cfg() {
   return vscode.workspace.getConfiguration('simpleAutocomplete');
@@ -187,13 +194,15 @@ async function updateStatusBar(context) {
   const auth = await getApiKey(context);
   const model = String(c.get('model', '')).trim() || '(not configured)';
   const ready = auth.key && model !== '(not configured)' && String(c.get('endpoint', '')).trim();
-  statusBarItem.text = activeCompletion ? '$(sync~spin) SA' : ready ? '$(sparkle) SA' : '$(warning) SA';
+  const editCount = [...pendingEdits.values()].reduce((count, entry) => count + entry.edits.length, 0);
+  statusBarItem.text = activeCompletion || activeEditRequest ? '$(sync~spin) SA' : ready ? `$(sparkle) SA${editCount ? ` ${editCount}` : ''}` : '$(warning) SA';
   statusBarItem.tooltip = [
     'Simple Autocomplete',
     `Model: ${model}`,
     `API mode: ${c.get('apiMode', 'auto')}`,
     `API key: ${auth.key ? `available via ${auth.source}` : `missing (${auth.source})`}`,
     lastRequest ? `Last request: ${lastRequest}` : 'No requests yet',
+    `${editCount} suggested replacement(s). Preview or apply using the actions above the affected lines.`,
     'Click to configure'
   ].join('\n');
   statusBarItem.backgroundColor = ready ? undefined : new vscode.ThemeColor('statusBarItem.warningBackground');
@@ -232,26 +241,62 @@ async function fetchCompletion(context, document, position, inlineContext, token
 // elsewhere: the model returns find/replace pairs, we locate each one exactly and
 // anchor a lens on its line.
 
-function editsKey(document) {
-  return document.uri.toString();
+function editFingerprint(edit) { return JSON.stringify([edit.find, edit.replace]); }
+
+function cancelEditRequest() {
+  clearTimeout(editTimer);
+  editTimer = undefined;
+  activeEditRequest?.cancel();
+  editRequestSerial++;
 }
 
-async function suggestEdits(context) {
+function supportsEditSuggestions(document) {
+  const c = cfg();
+  if (!c.get('enabled', true) || c.get('excludedLanguages', ['plaintext', 'dotenv', 'scminput']).includes(document.languageId)) return false;
+  if (!['file', 'untitled', 'vscode-notebook-cell'].includes(document.uri.scheme)) return false;
+  try { return resolveApiMode(c.get('apiMode', 'auto'), c.get('endpoint', '')) === 'chat'; }
+  catch { return false; }
+}
+
+function scheduleEditSuggestions(context, document) {
+  cancelEditRequest();
   const editor = vscode.window.activeTextEditor;
+  if (applyingSuggestedEdit || !cfg().get('suggestEditsAutomatically', true) || !editor || editor.document !== document || !supportsEditSuggestions(document)) return;
+  const version = document.version;
+  editTimer = setTimeout(() => {
+    editTimer = undefined;
+    if (document.isClosed || document.version !== version || vscode.window.activeTextEditor !== editor) return;
+    return suggestEdits(context, { automatic: true, editor });
+  }, cfg().get('editDebounceMs', 1500));
+}
+
+async function suggestEdits(context, { automatic = false, editor = vscode.window.activeTextEditor } = {}) {
   if (!editor) {
-    vscode.window.showInformationMessage('Simple Autocomplete: open a file first.');
+    if (!automatic) vscode.window.showInformationMessage('Simple Autocomplete: open a file first.');
     return;
   }
   const document = editor.document;
   const c = cfg();
   if (!c.get('enabled', true)) return;
   if (c.get('excludedLanguages', ['plaintext', 'dotenv', 'scminput']).includes(document.languageId)) return;
+  if (!supportsEditSuggestions(document)) {
+    if (!automatic) vscode.window.showInformationMessage('Simple Autocomplete: suggested replacements require a chat completions endpoint. Native FIM remains available for inline completion.');
+    return;
+  }
 
+  cancelEditRequest();
+  const serial = editRequestSerial;
+  const cancellation = new vscode.CancellationTokenSource();
+  activeEditRequest = cancellation;
+  const key = document.uri.toString();
   const fullText = document.getText();
   const version = document.version;
-  const cursorOffset = document.offsetAt(editor.selection.active);
-  const code = fullText.slice(cropStart(fullText, cursorOffset, 6000), cropEnd(fullText, cursorOffset, 4000));
-  const maxEdits = c.get('maxEdits', 3);
+  const position = editor.selection.active;
+  const cursorOffset = document.offsetAt(position);
+  const startOffset = cropStart(fullText, cursorOffset, 6000);
+  const endOffset = cropEnd(fullText, cursorOffset, 4000);
+  const code = fullText.slice(startOffset, endOffset);
+  const maxEdits = automatic ? 1 : c.get('maxEdits', 3);
   const messages = [
     { role: 'system', content: editContract() },
     {
@@ -260,46 +305,101 @@ async function suggestEdits(context) {
         fileName: document.fileName || 'untitled',
         languageId: document.languageId,
         code,
-        maxEdits
+        maxEdits,
+        currentLine: document.lineAt(position.line).text,
+        automatic
       })
     }
   ];
 
   try {
     if (statusBarItem) statusBarItem.text = '$(sync~spin) SA';
-    const { raw } = await requestCompletion(context, messages, undefined, {
+    const { raw } = await requestCompletion(context, messages, cancellation.token, {
       max_tokens: Math.max(c.get('maxTokens', 256), 700),
       timeoutMs: Math.max(c.get('timeoutMs', 5000), 30000)
     });
-    if (document.version !== version || document.isClosed) return;
-    const edits = parseEditSuggestions(raw, fullText, maxEdits).map((edit, index) => ({
+    if (cancellation.token.isCancellationRequested || serial !== editRequestSerial || document.version !== version || document.isClosed) return;
+    const rejected = automatic ? dismissedEdits.get(key) : undefined;
+    const edits = parseEditSuggestions(raw, fullText, maxEdits, { startOffset, endOffset })
+      .map((edit, index) => ({
       ...edit,
-      id: `${document.version}-${index}`
-    }));
+      replace: document.eol === vscode.EndOfLine.CRLF ? edit.replace.replace(/\r?\n/g, '\r\n') : edit.replace.replace(/\r\n/g, '\n'),
+      id: `${version}-${serial}-${index}`
+    }))
+      .filter(edit => edit.find !== edit.replace && !rejected?.has(editFingerprint(edit)));
     if (edits.length) {
-      pendingEdits.set(editsKey(document), { version: document.version, edits });
+      pendingEdits.set(key, { version, edits });
     } else {
-      pendingEdits.delete(editsKey(document));
+      pendingEdits.delete(key);
     }
     codeLensEmitter?.fire();
-    vscode.window.showInformationMessage(
+    if (!automatic) vscode.window.showInformationMessage(
       edits.length
         ? `Simple Autocomplete: ${edits.length} suggested edit(s). Click the sparkle lens above the line.`
         : 'Simple Autocomplete: no edits suggested for this file.'
     );
   } catch (err) {
-    output.appendLine(`[edits] ${err?.stack || err}`);
-    vscode.window.showErrorMessage(`Simple Autocomplete: ${err?.message || err}`);
+    if (err?.name !== 'AbortError') {
+      output.appendLine(`[edits] ${err?.stack || err}`);
+      if (!automatic) vscode.window.showErrorMessage(`Simple Autocomplete: ${err?.message || err}`);
+    }
   } finally {
-    if (statusBarItem) statusBarItem.text = '$(sparkle) SA';
+    if (activeEditRequest === cancellation) activeEditRequest = undefined;
+    cancellation.dispose();
+    await updateStatusBar(context);
   }
 }
 
-async function applySuggestedEdit(uriString, editId) {
+function selectedEdit(uriString, editId) {
+  const editor = vscode.window.activeTextEditor;
+  const preview = editor && editPreviews.get(editor.document.uri.toString());
+  uriString ||= preview?.sourceUri || editor?.document.uri.toString();
+  editId ||= preview?.editId;
   const entry = pendingEdits.get(uriString);
-  if (!entry) return;
-  const edit = entry.edits.find(candidate => candidate.id === editId);
-  if (!edit) return;
+  if (!entry) return null;
+  let edit;
+  if (editId) edit = entry.edits.find(candidate => candidate.id === editId);
+  else {
+    const offset = editor?.document.uri.toString() === uriString ? editor.document.offsetAt(editor.selection.active) : 0;
+    edit = [...entry.edits].sort((a, b) => Math.abs(a.startOffset - offset) - Math.abs(b.startOffset - offset))[0];
+  }
+  return edit ? { uriString, entry, edit } : null;
+}
+
+async function previewSuggestedEdit(uriString, editId) {
+  const selected = selectedEdit(uriString, editId);
+  if (!selected) return;
+  const { entry, edit } = selected;
+  const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(selected.uriString));
+  if (entry.version !== document.version) return;
+  const original = document.getText();
+  const modified = original.slice(0, edit.startOffset) + edit.replace + original.slice(edit.endOffset);
+  const before = vscode.Uri.from({ scheme: PREVIEW_SCHEME, path: document.uri.path, query: `${edit.id}-before` });
+  const after = vscode.Uri.from({ scheme: PREVIEW_SCHEME, path: document.uri.path, query: `${edit.id}-after` });
+  editPreviews.set(before.toString(), { text: original, sourceUri: selected.uriString, editId: edit.id });
+  editPreviews.set(after.toString(), { text: modified, sourceUri: selected.uriString, editId: edit.id });
+  await vscode.commands.executeCommand('vscode.diff', before, after, `Simple Autocomplete: ${edit.reason || 'Suggested replacement'}`);
+}
+
+function dismissSuggestedEdit(uriString, editId) {
+  const selected = selectedEdit(uriString, editId);
+  if (!selected) return;
+  cancelEditRequest();
+  const rejected = dismissedEdits.get(selected.uriString) || new Set();
+  rejected.add(editFingerprint(selected.edit));
+  if (rejected.size > 50) rejected.delete(rejected.values().next().value);
+  dismissedEdits.set(selected.uriString, rejected);
+  const remaining = selected.entry.edits.filter(edit => edit.id !== selected.edit.id);
+  if (remaining.length) pendingEdits.set(selected.uriString, { ...selected.entry, edits: remaining });
+  else pendingEdits.delete(selected.uriString);
+  codeLensEmitter?.fire();
+}
+
+async function applySuggestedEdit(uriString, editId) {
+  const selected = selectedEdit(uriString, editId);
+  if (!selected) return;
+  const { entry, edit } = selected;
+  uriString = selected.uriString;
 
   const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(uriString));
   if (entry.version !== document.version || document.getText().slice(edit.startOffset, edit.endOffset) !== edit.find) {
@@ -310,12 +410,18 @@ async function applySuggestedEdit(uriString, editId) {
   const workspaceEdit = new vscode.WorkspaceEdit();
   const range = new vscode.Range(document.positionAt(edit.startOffset), document.positionAt(edit.endOffset));
   workspaceEdit.replace(document.uri, range, edit.replace);
-  if (!(await vscode.workspace.applyEdit(workspaceEdit))) return;
+  cancelEditRequest();
+  applyingSuggestedEdit = true;
+  try {
+    if (!(await vscode.workspace.applyEdit(workspaceEdit))) return;
+  } finally {
+    applyingSuggestedEdit = false;
+  }
 
   // Offsets shift after an edit: re-locate the remaining suggestions on the new text.
   const updatedText = document.getText();
   const remaining = entry.edits
-    .filter(candidate => candidate.id !== editId)
+    .filter(candidate => candidate.id !== edit.id)
     .map(candidate => {
       const resolved = resolveUniqueRange(updatedText, candidate.find);
       return resolved ? { ...candidate, ...resolved } : null;
@@ -362,6 +468,8 @@ async function currentConfig(context) {
     prefixChars: c.get('prefixChars', 4000),
     suffixChars: c.get('suffixChars', 1500),
     debounceMs: c.get('debounceMs', 150),
+    suggestEditsAutomatically: c.get('suggestEditsAutomatically', true),
+    editDebounceMs: c.get('editDebounceMs', 1500),
     timeoutMs: c.get('timeoutMs', 5000),
     maxLines: c.get('maxLines', 20),
     conservative: c.get('conservative', true),
@@ -420,6 +528,9 @@ async function renderConfigPanel(context, panel, message = '', kind = 'info') {
     <div><label for="debounceMs">Typing delay (ms)</label><input id="debounceMs" type="number" min="0" max="2000" value="${v.debounceMs}"></div>
     <div class="full"><label for="systemPrompt">Chat system prompt (ignored in native FIM)</label><textarea id="systemPrompt">${escapeHtml(v.systemPrompt)}</textarea><div class="muted">A response contract is appended automatically for chat requests.</div></div>
     <div class="full row"><input id="conservative" type="checkbox" ${v.conservative ? 'checked' : ''}><label for="conservative" style="margin:0">Conservative automatic suggestions (skip low-signal contexts)</label></div>
+    <div class="full row"><input id="suggestEditsAutomatically" type="checkbox" ${v.suggestEditsAutomatically ? 'checked' : ''}><label for="suggestEditsAutomatically" style="margin:0">Suggest replacements after a typing pause (chat mode)</label></div>
+    <div><label for="editDebounceMs">Replacement suggestion delay (ms)</label><input id="editDebounceMs" type="number" min="500" max="30000" value="${v.editDebounceMs}"></div>
+    <div class="muted">Proposes up to one replacement per pause. Preview the diff, apply or dismiss it using the actions above the affected line. Changes are applied only when accepted.</div>
     <div class="full"><label for="extraBody">Extra generation options (JSON)</label><textarea id="extraBody">${escapeHtml(v.extraBody)}</textarea><div class="muted">For example { "reasoning_effort": "none" } if supported by the chat model. Model, stream and context fields are managed by the extension.</div></div>
     <div><label for="maxTokens">Max tokens</label><input id="maxTokens" type="number" value="${v.maxTokens}"></div>
     <div><label for="temperature">Temperature</label><input id="temperature" type="number" step="0.1" value="${v.temperature}"></div>
@@ -442,6 +553,7 @@ const number = id => Number(value(id));
 document.getElementById('save').addEventListener('click', () => {
   vscode.postMessage({ type:'save', data:{
     enabled: document.getElementById('enabled').checked,
+    suggestEditsAutomatically:document.getElementById('suggestEditsAutomatically').checked, editDebounceMs:number('editDebounceMs'),
     endpoint:value('endpoint'), model:value('model'), apiMode:value('apiMode'), debounceMs:number('debounceMs'),
     apiKeySource:document.querySelector('input[name="keySource"]:checked').value,
     apiKeyEnvVar:value('envVar'), apiKey:value('apiKey'), systemPrompt:value('systemPrompt'), extraBody:value('extraBody'), responseFormat:value('responseFormat'),
@@ -468,6 +580,8 @@ async function saveConfig(context, data) {
     c.update('endpoint', String(data.endpoint).trim(), target),
     c.update('apiMode', ['chat', 'fim'].includes(data.apiMode) ? data.apiMode : 'auto', target),
     c.update('debounceMs', Math.max(0, Math.min(2000, Number(data.debounceMs) || 0)), target),
+    c.update('suggestEditsAutomatically', Boolean(data.suggestEditsAutomatically), target),
+    c.update('editDebounceMs', Math.max(500, Math.min(30000, Number(data.editDebounceMs) || 1500)), target),
     c.update('model', String(data.model).trim(), target),
     c.update('apiKeySource', data.apiKeySource === 'secret' ? 'secret' : 'environment', target),
     c.update('apiKeyEnvVar', String(data.apiKeyEnvVar).trim(), target),
@@ -559,10 +673,25 @@ async function activate(context) {
       vscode.window.showInformationMessage(`Simple Autocomplete — ${status}. Model: ${c.get('model', '') || '(not configured)'}. API: ${mode}. ${lastRequest}`);
     }),
     vscode.commands.registerCommand('simpleAutocomplete.suggestEdits', () => suggestEdits(context)),
-    vscode.commands.registerCommand('simpleAutocomplete.applyEdit', (uriString, editId) => applySuggestedEdit(uriString, editId)),
+    vscode.commands.registerCommand('simpleAutocomplete.applyEdit', async (uriString, editId) => {
+      await applySuggestedEdit(uriString, editId);
+      await updateStatusBar(context);
+    }),
+    vscode.commands.registerCommand('simpleAutocomplete.previewEdit', (uriString, editId) => previewSuggestedEdit(uriString, editId)),
+    vscode.commands.registerCommand('simpleAutocomplete.dismissEdit', async (uriString, editId) => {
+      dismissSuggestedEdit(uriString, editId);
+      await updateStatusBar(context);
+    }),
     vscode.commands.registerCommand('simpleAutocomplete.clearEdits', () => {
+      cancelEditRequest();
+      for (const [uriString, entry] of pendingEdits) {
+        const rejected = dismissedEdits.get(uriString) || new Set();
+        for (const edit of entry.edits) rejected.add(editFingerprint(edit));
+        dismissedEdits.set(uriString, rejected);
+      }
       pendingEdits.clear();
       codeLensEmitter?.fire();
+      void updateStatusBar(context);
     })
   );
 
@@ -577,6 +706,9 @@ async function activate(context) {
     vscode.workspace.onDidChangeConfiguration(async e => {
       if (e.affectsConfiguration('simpleAutocomplete')) {
         activeCompletion?.cancel();
+        cancelEditRequest();
+        pendingEdits.clear();
+        codeLensEmitter?.fire();
         await updateStatusBar(context);
       }
     })
@@ -589,17 +721,31 @@ async function activate(context) {
   context.subscriptions.push(codeLensEmitter);
   context.subscriptions.push(
     vscode.workspace.onDidChangeTextDocument(event => {
+      if (!event.contentChanges.length) return;
       if (event.document.uri.toString() === activeCompletionUri) activeCompletion?.cancel();
       const entry = pendingEdits.get(event.document.uri.toString());
       if (entry && entry.version !== event.document.version) {
         pendingEdits.delete(event.document.uri.toString());
         codeLensEmitter?.fire();
       }
+      if (vscode.window.activeTextEditor?.document === event.document) scheduleEditSuggestions(context, event.document);
     }),
     vscode.workspace.onDidSaveTextDocument(async document => {
       if (!cfg().get('suggestEditsOnSave', false)) return;
       if (vscode.window.activeTextEditor?.document.uri.toString() !== document.uri.toString()) return;
-      await suggestEdits(context);
+      if (supportsEditSuggestions(document)) await suggestEdits(context, { automatic: true });
+    }),
+    vscode.window.onDidChangeActiveTextEditor(() => cancelEditRequest()),
+    vscode.workspace.onDidCloseTextDocument(document => {
+      const key = document.uri.toString();
+      pendingEdits.delete(key);
+      dismissedEdits.delete(key);
+      editPreviews.delete(key);
+      if (activeCompletionUri === key) activeCompletion?.cancel();
+      if (vscode.window.activeTextEditor?.document === document) cancelEditRequest();
+    }),
+    vscode.workspace.registerTextDocumentContentProvider(PREVIEW_SCHEME, {
+      provideTextDocumentContent: uri => editPreviews.get(uri.toString())?.text ?? ''
     })
   );
 
@@ -609,14 +755,23 @@ async function activate(context) {
     provideCodeLenses(document) {
       const entry = pendingEdits.get(document.uri.toString());
       if (!entry || entry.version !== document.version) return [];
-      return entry.edits.map(edit => {
+      return entry.edits.flatMap(edit => {
         const position = document.positionAt(edit.startOffset);
-        return new vscode.CodeLens(document.lineAt(position.line).range, {
-          title: `$(sparkle) ${edit.reason || 'Apply suggested edit'}`,
+        const range = document.lineAt(position.line).range;
+        return [new vscode.CodeLens(range, {
+          title: `$(sparkle) Preview: ${edit.reason || 'Suggested replacement'}`,
           tooltip: `${edit.find.trim()}\n→\n${edit.replace.trim()}`,
+          command: 'simpleAutocomplete.previewEdit',
+          arguments: [document.uri.toString(), edit.id]
+        }), new vscode.CodeLens(range, {
+          title: 'Apply',
           command: 'simpleAutocomplete.applyEdit',
           arguments: [document.uri.toString(), edit.id]
-        });
+        }), new vscode.CodeLens(range, {
+          title: 'Dismiss',
+          command: 'simpleAutocomplete.dismissEdit',
+          arguments: [document.uri.toString(), edit.id]
+        })];
       });
     }
   }));
@@ -654,5 +809,9 @@ async function activate(context) {
   }));
 }
 
-function deactivate() { activeCompletion?.cancel(); }
+function deactivate() {
+  activeCompletion?.cancel();
+  cancelEditRequest();
+  editPreviews.clear();
+}
 module.exports = { activate, deactivate };

@@ -2,7 +2,7 @@
   "name": "simple-autocomplete",
   "displayName": "Simple Autocomplete: AI Inline Completions",
   "description": "Inline code completion for chat APIs and native fill-in-the-middle APIs, including GreenPT and Mistral Codestral.",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "publisher": "local",
   "license": "MIT",
   "author": {
@@ -65,7 +65,15 @@
       },
       {
         "command": "simpleAutocomplete.applyEdit",
-        "title": "Simple Autocomplete: Apply Suggested Edit"
+        "title": "Simple Autocomplete: Apply Nearest Suggested Edit"
+      },
+      {
+        "command": "simpleAutocomplete.previewEdit",
+        "title": "Simple Autocomplete: Preview Nearest Suggested Edit"
+      },
+      {
+        "command": "simpleAutocomplete.dismissEdit",
+        "title": "Simple Autocomplete: Dismiss Nearest Suggested Edit"
       },
       {
         "command": "simpleAutocomplete.clearEdits",
@@ -204,6 +212,18 @@
           "default": false,
           "description": "After saving a file, ask the model for suggested edits around the cursor and show them as clickable CodeLens actions."
         },
+        "simpleAutocomplete.suggestEditsAutomatically": {
+          "type": "boolean",
+          "default": true,
+          "description": "After a typing pause, ask the chat model for up to one replacement around the cursor. Suggestions can change existing lines and always require explicit acceptance. Ignored in native FIM mode."
+        },
+        "simpleAutocomplete.editDebounceMs": {
+          "type": "number",
+          "default": 1500,
+          "minimum": 500,
+          "maximum": 30000,
+          "description": "Typing pause before requesting replacement suggestions. Each review is a separate chat request; resume typing to cancel it."
+        },
         "simpleAutocomplete.maxEdits": {
           "type": "number",
           "default": 3,
@@ -218,6 +238,12 @@
         "command": "simpleAutocomplete.suggestEdits",
         "key": "ctrl+alt+.",
         "mac": "cmd+alt+.",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "simpleAutocomplete.applyEdit",
+        "key": "ctrl+alt+enter",
+        "mac": "cmd+alt+enter",
         "when": "editorTextFocus"
       }
     ]

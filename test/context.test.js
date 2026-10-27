@@ -314,3 +314,20 @@ test('builds an edit review request in find/replace form', () => {
   assert.match(message, /<CODE>\nx = 1\n<\/CODE>/);
   assert.match(editContract(), /code reviewer/);
 });
+
+test('edit matches must be unique even when occurrences overlap', () => {
+  assert.equal(resolveUniqueRange('aaa', 'aa'), null);
+});
+
+test('edit review rejects overlapping suggestions and changes outside the supplied context', () => {
+  const text = 'outside\nfirst second\nlast';
+  const raw = JSON.stringify({ edits: [
+    { find: 'outside', replace: 'OUTSIDE' },
+    { find: 'first second', replace: 'changed' },
+    { find: 'second', replace: 'overlaps' },
+    { find: 'last', replace: 'LAST' }
+  ] });
+  const edits = parseEditSuggestions(raw, text, 3, { startOffset: 8, endOffset: 20 });
+  assert.equal(edits.length, 1);
+  assert.equal(edits[0].find, 'first second');
+});

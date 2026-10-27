@@ -2,7 +2,7 @@
 
 A VS Code inline code completion extension for chat APIs (including GreenPT) and native fill-in-the-middle APIs (including Mistral Codestral).
 
-[![Version](https://img.shields.io/badge/version-0.10.0-blue.svg)](https://github.com/eliottcrancee/simple-autocomplete/releases)
+[![Version](https://img.shields.io/badge/version-0.11.0-blue.svg)](https://github.com/eliottcrancee/simple-autocomplete/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## Features
@@ -19,14 +19,15 @@ A VS Code inline code completion extension for chat APIs (including GreenPT) and
 - Status bar indicator: shows disabled/ready/warning state, a spinner while a request is in flight, and opens the configuration panel on click.
 - Debounces automatic requests and aborts stale HTTP requests while you keep typing. Explicit requests bypass the typing delay. Responses from an older document version are discarded.
 - Request duration and errors are available in the **Simple Autocomplete** Output channel and status tooltip.
-- **Suggested edits anywhere in the document.** `Cmd+Alt+.` asks the model to review the code around the cursor and shows each minimal correction as a clickable CodeLens above the line it changes. Edits are transmitted as exact *find*/*replace* pairs and applied by unique match, so a fix that is not at the cursor (for example changing `x: str = None` to `x: str | None = None`) is still one click away. Enable `simpleAutocomplete.suggestEditsOnSave` to run it on every save.
+- **Automatic replacements around the cursor (chat mode).** After a 1.5-second typing pause, the model can propose one correction to existing code, including a nearby line. Each suggestion has **Preview**, **Apply**, and **Dismiss** actions above the affected line. Preview opens a native before/after diff; acceptance applies the replacement to the original file. `Cmd+Alt+.` requests a manual review with up to `maxEdits` suggestions.
+- **Cancellation and dismissal for edit suggestions.** Typing cancels the pending review and invalidates old suggestions. Dismissed replacements are not reoffered automatically in the same file session. Acceptance relocates any remaining suggestions and does not immediately trigger another review.
 
 ## Install
 
 Download the `.vsix` from the [latest release](https://github.com/eliottcrancee/simple-autocomplete/releases/latest), then run:
 
 ```bash
-code --install-extension ./simple-autocomplete-0.10.0.vsix --force
+code --install-extension ./simple-autocomplete-0.11.0.vsix --force
 ```
 
 Reload VS Code after upgrading. If `code` is unavailable on macOS, run **Shell Command: Install 'code' command in PATH** from VS Code's Command Palette.
@@ -65,7 +66,11 @@ The system prompt and `responseFormat` apply to chat only. `responseFormat` defa
 
 ## Suggested edits anywhere (chat mode)
 
-VS Code's stable inline-completion API can only render ghost text on the cursor line. To propose an edit elsewhere, run **Simple Autocomplete: Suggest Edits Around Cursor** (`Cmd+Alt+.` / `Ctrl+Alt+.`):
+Inline completion inserts ghost text at the cursor. Replacement suggestions can change existing text on the cursor line or elsewhere in the surrounding context, including multiple lines.
+
+In chat mode, `simpleAutocomplete.suggestEditsAutomatically` defaults to `true`. After `simpleAutocomplete.editDebounceMs` (default 1500 ms) without typing, the extension sends a separate review request and displays at most one proposed replacement. Resume typing or switch editors to cancel that request. Automatic reviews do not display notification popups or edit the buffer.
+
+For example, a review can suggest changing the last line below while your cursor is elsewhere nearby:
 
 ```python
 class GenerationFeature(FeatureConfig):
@@ -74,7 +79,11 @@ class GenerationFeature(FeatureConfig):
     actual_counterpart: str = None      # ⟵ a sparkle CodeLens appears here
 ```
 
-Click the CodeLens to apply the change (`actual_counterpart: str | None = None`). Suggestions are cleared as soon as you type, and are limited by `simpleAutocomplete.maxEdits`.
+Use **Preview** to inspect the diff, **Apply** to accept it, or **Dismiss** to reject it. `Cmd+Alt+Enter` / `Ctrl+Alt+Enter` applies the nearest suggested edit, including from its diff preview. The corresponding preview, apply and dismiss commands are also available in the Command Palette.
+
+`Cmd+Alt+.` / `Ctrl+Alt+.` requests a manual review with up to `simpleAutocomplete.maxEdits` suggestions. Set `simpleAutocomplete.suggestEditsAutomatically` to `false` to keep reviews manual, or enable `simpleAutocomplete.suggestEditsOnSave` for save-triggered reviews. Each automatic review is an additional API request; increasing `editDebounceMs` reduces how often it runs.
+
+Edits use exact, unique find/replace matches within the code sent to the model. Overlapping proposals and stale document versions are rejected. Suggestions are cleared when the document changes, and a dismissed replacement stays suppressed in automatic reviews until the source file is closed or the extension is reloaded. A manual review can request it again.
 
 Suggested edit review needs a chat endpoint. In native FIM mode, this command reports that requirement rather than sending an incompatible payload.
 
